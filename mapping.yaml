@@ -1,0 +1,77 @@
+midi:
+  port_name: VoiceMix
+  channel: 1
+
+bank_aliases:
+  plugin: plugin1
+  p1: plugin1
+  vox: plugin1
+  voice: plugin1
+  trk: track
+  mixer: track
+  channel: track
+
+banks:
+  plugin1:
+    highpass_freq:
+      cc: 20
+      min: 0
+      max: 127
+      default: 24
+      step: 0.04
+    low_mid_cut:
+      cc: 21
+      min: 0
+      max: 127
+      default: 64
+      step: 0.04
+    brightness:
+      cc: 22
+      min: 0
+      max: 127
+      default: 64
+      step: 0.04
+    presence:
+      cc: 23
+      min: 0
+      max: 127
+      default: 64
+      step: 0.04
+    compressor_amount:
+      cc: 24
+      min: 0
+      max: 127
+      default: 48
+      step: 0.04
+    de_esser_amount:
+      cc: 25
+      min: 0
+      max: 127
+      default: 40
+      step: 0.04
+    reverb_send:
+      cc: 26
+      min: 0
+      max: 127
+      default: 24
+      step: 0.04
+    delay_send:
+      cc: 27
+      min: 0
+      max: 127
+      default: 16
+      step: 0.04
+
+  track:
+    volume:
+      cc: 7
+      min: 0
+      max: 127
+      default: 100
+      step: 0.03
+    pan:
+      cc: 10
+      min: 0
+      max: 127
+      default: 64
+      step: 0.04

@@ -1,0 +1,45 @@
+targets:
+  lead_vox:
+    aliases:
+    - lead vox
+    - vocals
+    - voice
+    - vox
+    channel: 1
+    default_bank: plugin1
+  guitar_1:
+    aliases:
+    - guitar 1
+    - gtr 1
+    - left guitar
+    - rhythm guitar
+    channel: 2
+    default_bank: plugin1
+  guitar_2:
+    aliases:
+    - guitar 2
+    - gtr 2
+    - right guitar
+    - double guitar
+    channel: 3
+    default_bank: plugin1
+  bass:
+    aliases:
+    - bass
+    - bass guitar
+    channel: 4
+    default_bank: plugin1
+  drum_bus:
+    aliases:
+    - drums
+    - drum bus
+    - kit
+    channel: 5
+    default_bank: plugin1
+  guitar_3:
+    aliases:
+    - g3
+    - guitar3
+    - thirdgtr
+    channel: 6
+    default_bank: plugin1

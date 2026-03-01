@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtualenv
+.venv/
+
+# Local env
+.env
+
+# Runtime outputs
+logs/
+.voicemix/
+
+# macOS
+.DS_Store
+
+# Build/packaging
+.appbuild/
