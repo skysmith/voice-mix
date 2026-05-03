@@ -2,6 +2,23 @@
 
 VoiceMix is a local macOS tool for controlling Logic Pro with natural language.
 
+## Workspace Metadata
+
+- Name: VoiceMix
+- Domain: lab
+- Status: active
+- Purpose: Natural-language control surface for Logic Pro using MIDI mappings and local tooling
+- Path: lab/audio/voice-mix
+- Related:
+  - lab/audio
+  - personal/music
+  - lab/ai
+- Tags:
+  - midi
+  - logic
+  - audio
+  - control-surface
+
 It translates text into strict action JSON, resolves those actions through your YAML mapping, and emits MIDI CC messages to an IAC bus (default: `VoiceMix`).
 
 ## License
@@ -28,7 +45,7 @@ MIT. See [LICENSE](LICENSE).
 ## Quickstart
 
 ```bash
-cd /Users/sky/.openclaw/workspace/voice-mix
+cd ~/Documents/Codex/lab/audio/voice-mix
 ./setup.sh
 source .venv/bin/activate
 ```
@@ -81,11 +98,16 @@ Common commands:
 - `/target [name]`
 - `/target list`
 - `/target add <name> <channel> [aliases_csv] [default_bank]`
+- `/target wizard`
+- `/target import` (guided Logic track-by-track import)
 - `/preset save <name>`
 - `/preset save-current <name>`
 - `/preset list`
 - `/preset show <name>`
 - `/preset apply <name>`
+- `/channel verify [cc] [start-end]`
+- `/channel test <channel> [cc]`
+- `/midi health`
 
 Natural examples:
 
@@ -102,11 +124,15 @@ python3 gui.py --dry
 GUI includes:
 
 - target + bank selectors
+- MIDI port field + refresh ports
 - DRY/APPLY mode controls
 - text instruction input + live log
 - undo/status/learn controls
 - preset save/save-current/apply/show
 - target add dialog (persists to `targets.yaml`)
+- guided target import dialog (track-by-track)
+- Logic Learn tools: `Verify All`, `Verify Current`, `Learn Bind (Selected Param)`
+- `Session Setup Wizard` (port -> import -> verify -> learn bind)
 
 ## Customization
 
@@ -143,6 +169,7 @@ Phrase parsing can auto-switch target when an alias appears.
 - `gui.py`: Tkinter GUI
 - `mapping.yaml`: bank/CC map
 - `targets.yaml`: target aliases/channels
+- `LOGIC_BRIDGE_PROTOTYPE.md`: deeper automation roadmap
 - `setup.sh`: one-shot local setup
 - `VoiceMix.command`: desktop launcher for CLI
 - `VoiceMix-GUI.command`: desktop launcher for GUI

@@ -43,3 +43,8 @@ targets:
     - thirdgtr
     channel: 6
     default_bank: plugin1
+  sky_vocals_1:
+    aliases:
+    - sky_vocals_1
+    channel: 2
+    default_bank: plugin1

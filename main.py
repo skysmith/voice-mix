@@ -8,12 +8,14 @@ import json
 import os
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+from midi_bridge import midi_health, resolve_output_port_name, safe_list_output_ports
 
 try:
     import mido
@@ -281,6 +283,45 @@ class TargetConfig:
         self.save()
         return spec
 
+    def upsert_target(
+        self,
+        name: str,
+        channel: int,
+        aliases: list[str] | None = None,
+        default_bank: str | None = None,
+        keep_existing_aliases: bool = True,
+    ) -> TargetSpec:
+        canonical_name = re.sub(r"[^a-zA-Z0-9_]+", "_", name.strip()).strip("_").lower()
+        if not canonical_name:
+            raise ValueError("target name cannot be empty")
+        if channel < 1 or channel > 16:
+            raise ValueError("channel must be in 1..16")
+
+        existing = self.targets.get(canonical_name)
+        new_aliases = {a.strip().lower() for a in (aliases or []) if a.strip()}
+        if keep_existing_aliases and existing is not None:
+            new_aliases.update(existing.aliases)
+        norm_aliases = sorted(new_aliases)
+
+        resolved_default_bank = default_bank
+        if resolved_default_bank is not None:
+            resolved_default_bank = self.mapping.resolve_bank_name(resolved_default_bank, fallback=None)
+            if not resolved_default_bank:
+                raise ValueError("unknown default bank")
+        elif existing is not None:
+            resolved_default_bank = existing.default_bank
+
+        spec = TargetSpec(
+            name=canonical_name,
+            aliases=norm_aliases,
+            channel=channel,
+            default_bank=resolved_default_bank,
+        )
+        self.targets[canonical_name] = spec
+        self._rebuild_alias_index()
+        self.save()
+        return spec
+
     def resolve_target(self, name_or_alias: str) -> str | None:
         key = name_or_alias.strip().lower()
         if not key:
@@ -300,6 +341,138 @@ class TargetConfig:
             aliases = ", ".join(spec.aliases) if spec.aliases else "-"
             lines.append(f"- {target_name} (ch {spec.channel}, aliases: {aliases})")
         return "\n".join(lines)
+
+
+def suggest_aliases_from_name(name: str) -> list[str]:
+    base = name.strip().lower()
+    if not base:
+        return []
+    compact = re.sub(r"\s+", "", base)
+    underscored = re.sub(r"\s+", "_", base)
+    out = [base, compact, underscored]
+    if compact.startswith("guitar"):
+        out.append(compact.replace("guitar", "gtr"))
+    return sorted({a for a in out if a})
+
+
+def run_target_wizard(targets: TargetConfig, mapping: MappingConfig, logger: JsonLogger) -> list[str]:
+    created: list[str] = []
+    print("Target wizard. Press Enter on track name to stop.")
+    print(f"Available banks: {', '.join(mapping.banks.keys())}")
+    while True:
+        raw_name = input("Track/target name: ").strip()
+        if not raw_name:
+            break
+
+        while True:
+            raw_channel = input("MIDI channel (1-16): ").strip()
+            try:
+                channel = int(raw_channel)
+            except ValueError:
+                print("Channel must be a number in 1..16.")
+                continue
+            if 1 <= channel <= 16:
+                break
+            print("Channel must be in 1..16.")
+
+        suggested = suggest_aliases_from_name(raw_name)
+        print(f"Suggested aliases: {', '.join(suggested) if suggested else '-'}")
+        raw_aliases = input("Aliases CSV (Enter to use suggested): ").strip()
+        aliases = [a.strip() for a in raw_aliases.split(",") if a.strip()] if raw_aliases else suggested
+
+        raw_default_bank = input("Default bank (optional): ").strip()
+        default_bank = raw_default_bank or None
+
+        try:
+            spec = targets.add_target(raw_name, channel, aliases, default_bank=default_bank)
+        except Exception as e:
+            print(f"Failed to add target: {e}")
+            continue
+
+        created.append(spec.name)
+        print(f"Added target: {spec.name} (ch {spec.channel}) aliases=[{', '.join(spec.aliases) if spec.aliases else '-'}]")
+        logger.log(
+            "target_wizard_add",
+            {
+                "target": spec.name,
+                "channel": spec.channel,
+                "aliases": spec.aliases,
+                "default_bank": spec.default_bank,
+                "file": str(targets.path),
+            },
+        )
+
+        again = input("Add another target? [y/N]: ").strip().lower()
+        if again not in {"y", "yes"}:
+            break
+    return created
+
+
+def run_target_import(targets: TargetConfig, mapping: MappingConfig, logger: JsonLogger) -> list[str]:
+    created: list[str] = []
+    print("Target import mode.")
+    print("For each step: click a track in Logic, then type the track name exactly as you want it.")
+    print("Press Enter on track name to finish.")
+    print(f"Available banks: {', '.join(mapping.banks.keys())}")
+
+    raw_start = input("Starting MIDI channel [1]: ").strip()
+    try:
+        next_channel = int(raw_start) if raw_start else 1
+    except ValueError:
+        next_channel = 1
+    if not (1 <= next_channel <= 16):
+        next_channel = 1
+
+    while True:
+        raw_name = input("\nSelect track in Logic now, then enter track name: ").strip()
+        if not raw_name:
+            break
+
+        while True:
+            raw_channel = input(f"Channel for '{raw_name}' [{next_channel}]: ").strip()
+            try:
+                channel = int(raw_channel) if raw_channel else next_channel
+            except ValueError:
+                print("Channel must be a number in 1..16.")
+                continue
+            if 1 <= channel <= 16:
+                break
+            print("Channel must be in 1..16.")
+
+        suggested = suggest_aliases_from_name(raw_name)
+        print(f"Suggested aliases: {', '.join(suggested) if suggested else '-'}")
+        raw_aliases = input("Aliases CSV (Enter to use suggested): ").strip()
+        aliases = [a.strip() for a in raw_aliases.split(",") if a.strip()] if raw_aliases else suggested
+
+        raw_default_bank = input("Default bank [plugin1]: ").strip()
+        default_bank = raw_default_bank or "plugin1"
+
+        try:
+            spec = targets.add_target(raw_name, channel, aliases, default_bank=default_bank)
+        except Exception as e:
+            print(f"Failed to add target: {e}")
+            continue
+
+        created.append(spec.name)
+        print(f"Imported: {spec.name} (ch {spec.channel}) aliases=[{', '.join(spec.aliases) if spec.aliases else '-'}]")
+        logger.log(
+            "target_import_add",
+            {
+                "target": spec.name,
+                "channel": spec.channel,
+                "aliases": spec.aliases,
+                "default_bank": spec.default_bank,
+                "file": str(targets.path),
+            },
+        )
+
+        if channel < 16:
+            next_channel = channel + 1
+        again = input("Import another selected track? [Y/n]: ").strip().lower()
+        if again in {"n", "no"}:
+            break
+    return created
+
 
 class StateStore:
     def __init__(self, path: Path):
@@ -405,8 +578,9 @@ class MidiOut:
     def __init__(self, port_name: str):
         if mido is None:
             raise RuntimeError("mido is not installed. Run: pip install -r requirements.txt")
-        self.port_name = port_name
-        self.port = mido.open_output(port_name)
+        resolved = resolve_output_port_name(port_name)
+        self.port_name = resolved
+        self.port = mido.open_output(resolved)
 
     @staticmethod
     def list_ports() -> list[str]:
@@ -654,6 +828,58 @@ def run_undo(state: StateStore, midi: MidiOut | None, dry_run: bool, logger: Jso
     logger.log("undo", {"count": len(entry), "events": entry})
 
 
+def run_channel_verify(
+    midi: MidiOut | None,
+    dry_run: bool,
+    logger: JsonLogger,
+    cc: int = 119,
+    start_channel: int = 1,
+    end_channel: int = 16,
+    dwell_seconds: float = 0.10,
+) -> None:
+    if start_channel > end_channel:
+        start_channel, end_channel = end_channel, start_channel
+    start_channel = max(1, min(16, start_channel))
+    end_channel = max(1, min(16, end_channel))
+    cc = max(0, min(127, cc))
+
+    pattern = [0, 32, 64, 96, 127, 0]
+    events: list[dict[str, Any]] = []
+    print(f"Channel verify: CC{cc}, channels {start_channel}..{end_channel}")
+    for ch in range(start_channel, end_channel + 1):
+        print(f"- channel {ch}")
+        for value in pattern:
+            if dry_run or midi is None:
+                print(f"  DRY CC{cc}={value} ch{ch}")
+            else:
+                midi.send_cc(cc, value, ch)
+                print(f"  sent CC{cc}={value} ch{ch}")
+                time.sleep(dwell_seconds)
+            events.append({"cc": cc, "value": value, "channel": ch, "dry_run": dry_run})
+    logger.log(
+        "channel_verify",
+        {"cc": cc, "start_channel": start_channel, "end_channel": end_channel, "events": events},
+    )
+
+
+def run_channel_test(
+    midi: MidiOut | None,
+    dry_run: bool,
+    logger: JsonLogger,
+    channel: int,
+    cc: int = 119,
+) -> None:
+    run_channel_verify(
+        midi=midi,
+        dry_run=dry_run,
+        logger=logger,
+        cc=cc,
+        start_channel=channel,
+        end_channel=channel,
+        dwell_seconds=0.12,
+    )
+
+
 def snapshot_from_state(mapping: MappingConfig, state: StateStore, target: str) -> dict[str, dict[str, int]]:
     snapshot: dict[str, dict[str, int]] = {}
     for bank, params in mapping.banks.items():
@@ -865,8 +1091,12 @@ def main() -> None:
         mapping.port_name = args.port
 
     if args.list_ports:
-        for p in MidiOut.list_ports():
-            print(p)
+        ports = safe_list_output_ports()
+        if not ports:
+            print("No MIDI output ports detected (or backend unavailable).")
+        else:
+            for p in ports:
+                print(p)
         return
 
     logger = JsonLogger(Path(args.log))
@@ -908,8 +1138,8 @@ def main() -> None:
 
     print(
         "VoiceMix REPL ready. Type text commands or: "
-        "/dry /apply /undo /target [name|list|add] /bank [name] /learn [full] "
-        "/preset [save|save-current|list|show|apply] /status /quit"
+        "/dry /apply /undo /target [name|list|add|wizard|import] /bank [name] /learn [full] "
+        "/preset [save|save-current|list|show|apply] /channel [verify|test] /midi health /status /quit"
     )
     print_status(mapping, targets, current_target, current_bank, current_channel, dry_run, midi is not None)
 
@@ -963,10 +1193,26 @@ def main() -> None:
                     print("Targets:")
                     print(targets.describe())
                     continue
+                if target_args and target_args[0].lower() == "wizard":
+                    created = run_target_wizard(targets, mapping, logger)
+                    if created:
+                        print(f"Wizard added {len(created)} target(s): {', '.join(created)}")
+                    else:
+                        print("Wizard canceled (no targets added).")
+                    continue
+                if target_args and target_args[0].lower() == "import":
+                    created = run_target_import(targets, mapping, logger)
+                    if created:
+                        print(f"Import added {len(created)} target(s): {', '.join(created)}")
+                    else:
+                        print("Import finished (no targets added).")
+                    continue
                 if target_args and target_args[0].lower() == "add":
                     if len(target_args) < 3:
                         print(
                             "Usage: /target add <name> <channel> [aliases_csv] [default_bank]\n"
+                            "       /target wizard\n"
+                            "       /target import\n"
                             "Example: /target add guitar_3 6 g3,guitar3 plugin1"
                         )
                         continue
@@ -999,7 +1245,7 @@ def main() -> None:
                 candidate = " ".join(target_args)
                 resolved_target = targets.resolve_target(candidate)
                 if not resolved_target:
-                    print(f"Unknown target '{candidate}'. Use /target list or /target add")
+                    print(f"Unknown target '{candidate}'. Use /target list, /target add, /target wizard, or /target import")
                     continue
                 current_target = resolved_target
                 current_channel = targets.targets[current_target].channel
@@ -1086,9 +1332,92 @@ def main() -> None:
                 print("Usage: /preset save <name> | /preset save-current <name> | /preset list | /preset show <name> | /preset apply <name>")
                 continue
 
+            if cmd == "/channel":
+                channel_args = shlex.split(line)[1:]
+                if not channel_args:
+                    print(
+                        "Usage: /channel verify [cc] [start-end]\n"
+                        "       /channel test <channel> [cc]\n"
+                        "Examples: /channel verify 119 1-16 | /channel test 2 119"
+                    )
+                    continue
+                sub = channel_args[0].lower()
+                if sub == "verify":
+                    cc = 119
+                    start_ch = 1
+                    end_ch = 16
+                    if len(channel_args) >= 2:
+                        try:
+                            cc = int(channel_args[1])
+                        except ValueError:
+                            print("CC must be an integer 0..127")
+                            continue
+                    if len(channel_args) >= 3:
+                        span = channel_args[2]
+                        if "-" in span:
+                            left, right = span.split("-", 1)
+                            try:
+                                start_ch = int(left)
+                                end_ch = int(right)
+                            except ValueError:
+                                print("Range must be start-end, e.g. 1-16")
+                                continue
+                        else:
+                            try:
+                                start_ch = int(span)
+                                end_ch = start_ch
+                            except ValueError:
+                                print("Channel range must be start-end or single channel.")
+                                continue
+                    run_channel_verify(
+                        midi=midi,
+                        dry_run=dry_run,
+                        logger=logger,
+                        cc=cc,
+                        start_channel=start_ch,
+                        end_channel=end_ch,
+                    )
+                    continue
+                if sub == "test":
+                    if len(channel_args) < 2:
+                        print("Usage: /channel test <channel> [cc]")
+                        continue
+                    try:
+                        test_ch = int(channel_args[1])
+                    except ValueError:
+                        print("Channel must be an integer in 1..16")
+                        continue
+                    test_cc = 119
+                    if len(channel_args) >= 3:
+                        try:
+                            test_cc = int(channel_args[2])
+                        except ValueError:
+                            print("CC must be an integer 0..127")
+                            continue
+                    run_channel_test(
+                        midi=midi,
+                        dry_run=dry_run,
+                        logger=logger,
+                        channel=test_ch,
+                        cc=test_cc,
+                    )
+                    continue
+                print("Usage: /channel verify [cc] [start-end] | /channel test <channel> [cc]")
+                continue
+
+            if cmd == "/midi":
+                midi_args = shlex.split(line)[1:]
+                if midi_args and midi_args[0].lower() == "health":
+                    report = midi_health(mapping.port_name)
+                    print("MIDI health:")
+                    print(json.dumps(report, indent=2))
+                    continue
+                print("Usage: /midi health")
+                continue
+
             print(
                 "Unknown command. Use /dry /apply /undo /target /bank /learn [full] "
-                "/preset [save|save-current|list|show|apply] /status /quit"
+                "/preset [save|save-current|list|show|apply] /channel [verify|test] /midi health /status /quit"
             )
             continue
 

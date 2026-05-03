@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /Users/sky/.openclaw/workspace/voice-mix
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 if [ -d ".venv" ]; then
   source .venv/bin/activate

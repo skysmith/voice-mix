@@ -10,8 +10,8 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any
 
+from midi_bridge import probe_output_port, resolve_output_port_name, safe_list_output_ports
 from main import (
-    ACTION_SCHEMA,
     ActionResolver,
     JsonLogger,
     LLMTranslator,
@@ -23,7 +23,6 @@ from main import (
     TargetConfig,
     apply_messages_to_snapshot,
     run_preset_apply,
-    run_preset_show,
     run_undo,
     snapshot_from_state,
     validate_action_doc,
@@ -99,6 +98,29 @@ class VoiceMixGuiController:
     def available_banks(self) -> list[str]:
         return list(self.mapping.banks.keys())
 
+    def available_ports(self) -> list[str]:
+        return safe_list_output_ports()
+
+    def set_port(self, port_name: str) -> str:
+        port_name = port_name.strip()
+        if not port_name:
+            raise ValueError("port name cannot be empty")
+        ok, detail = probe_output_port(port_name)
+        if not ok:
+            raise ValueError(f"port probe failed for '{port_name}': {detail}")
+        resolved = resolve_output_port_name(port_name)
+        self.mapping.port_name = resolved
+        if not self.dry_run:
+            self.midi = MidiOut(self.mapping.port_name)
+        self.logger.log("midi_port", {"port": self.mapping.port_name, "source": "gui"})
+        return f"MIDI port set to: {self.mapping.port_name}"
+
+    def available_params(self, bank: str | None = None) -> list[str]:
+        target_bank = bank or self.current_bank
+        if target_bank not in self.mapping.banks:
+            return []
+        return list(self.mapping.banks[target_bank].keys())
+
     def set_target(self, target_name: str) -> str:
         resolved = self.targets.resolve_target(target_name)
         if not resolved:
@@ -122,6 +144,9 @@ class VoiceMixGuiController:
 
     def set_mode(self, dry_run: bool) -> str:
         if not dry_run and self.midi is None:
+            ok, detail = probe_output_port(self.mapping.port_name)
+            if not ok:
+                raise RuntimeError(f"MIDI port '{self.mapping.port_name}' is not ready: {detail}")
             self.midi = MidiOut(self.mapping.port_name)
         self.dry_run = dry_run
         self.logger.log("mode", {"dry_run": self.dry_run, "source": "gui"})
@@ -173,6 +198,80 @@ class VoiceMixGuiController:
             },
         )
         return f"Added target: {spec.name} (ch {spec.channel}) aliases=[{', '.join(spec.aliases) if spec.aliases else '-'}]"
+
+    def channel_verify(self, cc: int = 119, start_channel: int = 1, end_channel: int = 16) -> list[str]:
+        if start_channel > end_channel:
+            start_channel, end_channel = end_channel, start_channel
+        start_channel = max(1, min(16, start_channel))
+        end_channel = max(1, min(16, end_channel))
+        cc = max(0, min(127, cc))
+
+        pattern = [0, 32, 64, 96, 127, 0]
+        lines: list[str] = [f"Channel verify: CC{cc}, channels {start_channel}..{end_channel}"]
+        events: list[dict[str, Any]] = []
+        for ch in range(start_channel, end_channel + 1):
+            lines.append(f"- channel {ch}")
+            for value in pattern:
+                if self.dry_run or self.midi is None:
+                    lines.append(f"  DRY CC{cc}={value} ch{ch}")
+                else:
+                    self.midi.send_cc(cc, value, ch)
+                    lines.append(f"  sent CC{cc}={value} ch{ch}")
+                events.append({"cc": cc, "value": value, "channel": ch, "dry_run": self.dry_run})
+        self.logger.log("channel_verify_gui", {"cc": cc, "start_channel": start_channel, "end_channel": end_channel, "events": events})
+        return lines
+
+    def pulse_param_for_learn(
+        self,
+        target_name: str,
+        channel: int,
+        bank: str,
+        param: str,
+        aliases_csv: str = "",
+    ) -> list[str]:
+        aliases = [a.strip() for a in aliases_csv.split(",") if a.strip()]
+        spec = self.targets.upsert_target(
+            name=target_name,
+            channel=channel,
+            aliases=aliases,
+            default_bank=bank,
+            keep_existing_aliases=True,
+        )
+        self.current_target = spec.name
+        self.current_channel = spec.channel
+        self.current_bank = bank
+        self._snapshot_for_target(self.current_target)
+
+        if bank not in self.mapping.banks or param not in self.mapping.banks[bank]:
+            raise ValueError("unknown bank/param for learn pulse")
+        cc = self.mapping.banks[bank][param].cc
+
+        pattern = [0, 64, 127, 64, 0]
+        lines: list[str] = [
+            f"Learn pulse target={self.current_target} ch={self.current_channel} bank={bank} param={param} CC{cc}",
+            "In Logic: arm Learn, select destination control, then watch pulses.",
+        ]
+        events: list[dict[str, Any]] = []
+        for value in pattern:
+            if self.dry_run or self.midi is None:
+                lines.append(f"DRY CC{cc}={value} ch{self.current_channel}")
+            else:
+                self.midi.send_cc(cc, value, self.current_channel)
+                lines.append(f"sent CC{cc}={value} ch{self.current_channel}")
+            events.append({"cc": cc, "value": value, "channel": self.current_channel, "dry_run": self.dry_run})
+        self.logger.log(
+            "logic_learn_pulse",
+            {
+                "target": self.current_target,
+                "channel": self.current_channel,
+                "bank": bank,
+                "param": param,
+                "cc": cc,
+                "events": events,
+                "source": "gui",
+            },
+        )
+        return lines
 
     def list_presets(self) -> list[str]:
         return [p.stem for p in self.presets.list_presets()]
@@ -279,6 +378,9 @@ class VoiceMixGuiApp(tk.Tk):
 
         self.target_var = tk.StringVar(value=self.controller.current_target)
         self.bank_var = tk.StringVar(value=self.controller.current_bank)
+        current_params = self.controller.available_params(self.controller.current_bank)
+        self.param_var = tk.StringVar(value=current_params[0] if current_params else "")
+        self.port_var = tk.StringVar(value=self.controller.mapping.port_name)
         self.mode_var = tk.StringVar(value="DRY" if self.controller.dry_run else "APPLY")
         self.preset_var = tk.StringVar()
 
@@ -301,6 +403,19 @@ class VoiceMixGuiApp(tk.Tk):
         self.bank_combo.pack(side=tk.LEFT, padx=(4, 8))
         self.bank_combo.bind("<<ComboboxSelected>>", self.on_bank_change)
 
+        current_params = self.controller.available_params(self.bank_var.get().strip() or self.controller.current_bank)
+        if current_params and not self.param_var.get():
+            self.param_var.set(current_params[0])
+        ttk.Label(top, text="Param:").pack(side=tk.LEFT)
+        self.param_combo = ttk.Combobox(top, state="readonly", textvariable=self.param_var, values=current_params, width=18)
+        self.param_combo.pack(side=tk.LEFT, padx=(4, 8))
+
+        ttk.Label(top, text="Port:").pack(side=tk.LEFT)
+        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=22)
+        self.port_combo.pack(side=tk.LEFT, padx=(4, 4))
+        self.port_combo.bind("<<ComboboxSelected>>", self.on_port_change)
+        ttk.Button(top, text="Refresh Ports", command=self.refresh_ports).pack(side=tk.LEFT, padx=(0, 8))
+
         ttk.Label(top, text="Mode:").pack(side=tk.LEFT)
         self.mode_label = ttk.Label(top, textvariable=self.mode_var, width=8)
         self.mode_label.pack(side=tk.LEFT, padx=(4, 4))
@@ -315,6 +430,15 @@ class VoiceMixGuiApp(tk.Tk):
         target_row = ttk.Frame(self, padding=(8, 0, 8, 8))
         target_row.pack(fill=tk.X)
         ttk.Button(target_row, text="Add Target", command=self.on_add_target).pack(side=tk.LEFT)
+        ttk.Button(target_row, text="Import Targets", command=self.on_import_targets).pack(side=tk.LEFT, padx=(6, 0))
+
+        learn_row = ttk.Frame(self, padding=(8, 0, 8, 8))
+        learn_row.pack(fill=tk.X)
+        ttk.Label(learn_row, text="Logic Learn:").pack(side=tk.LEFT)
+        ttk.Button(learn_row, text="Session Setup Wizard", command=self.on_session_setup_wizard).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(learn_row, text="Verify All (1-16)", command=self.on_verify_all_channels).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(learn_row, text="Verify Current", command=self.on_verify_current_channel).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(learn_row, text="Learn Bind (Selected Param)", command=self.on_learn_bind).pack(side=tk.LEFT, padx=(6, 0))
 
         preset_row = ttk.Frame(self, padding=(8, 0, 8, 8))
         preset_row.pack(fill=tk.X)
@@ -373,6 +497,10 @@ class VoiceMixGuiApp(tk.Tk):
         try:
             msg = self.controller.set_target(target)
             self.bank_var.set(self.controller.current_bank)
+            params = self.controller.available_params(self.controller.current_bank)
+            self.param_combo.configure(values=params)
+            if params:
+                self.param_var.set(params[0])
             self._log(msg)
         except Exception as e:
             self._log(f"Target error: {e}")
@@ -383,11 +511,36 @@ class VoiceMixGuiApp(tk.Tk):
             return
         try:
             self._log(self.controller.set_bank(bank))
+            params = self.controller.available_params(bank)
+            self.param_combo.configure(values=params)
+            if params:
+                self.param_var.set(params[0])
         except Exception as e:
             self._log(f"Bank error: {e}")
 
+    def refresh_ports(self) -> None:
+        ports = self.controller.available_ports()
+        current = self.port_var.get().strip()
+        if current and current not in ports:
+            ports = [current, *ports]
+        self.port_combo.configure(values=ports)
+        self._log(f"Detected MIDI ports: {', '.join(ports) if ports else '(none)'}")
+
+    def on_port_change(self, _event=None) -> None:
+        self._apply_port_from_ui()
+
+    def _apply_port_from_ui(self) -> None:
+        port = self.port_var.get().strip()
+        if not port:
+            return
+        try:
+            self._log(self.controller.set_port(port))
+        except Exception as e:
+            self._log(f"Port error: {e}")
+
     def set_mode(self, dry: bool) -> None:
         try:
+            self._apply_port_from_ui()
             msg = self.controller.set_mode(dry)
             self.mode_var.set("DRY" if self.controller.dry_run else "APPLY")
             self._log(msg)
@@ -423,6 +576,192 @@ class VoiceMixGuiApp(tk.Tk):
             self._log(msg)
         except Exception as e:
             self._log(f"Add target error: {e}")
+
+    def on_import_targets(self) -> None:
+        start_channel = simpledialog.askinteger(
+            "Import Targets",
+            "Starting MIDI channel (1-16):",
+            parent=self,
+            minvalue=1,
+            maxvalue=16,
+            initialvalue=1,
+        )
+        if start_channel is None:
+            return
+
+        next_channel = start_channel
+        count = 0
+        self._log("Target import mode: select a track in Logic, then enter its name in the prompt.")
+        while True:
+            name = simpledialog.askstring(
+                "Import Targets",
+                "Select a track in Logic, then enter track name (Cancel/blank to finish):",
+                parent=self,
+            )
+            if not name or not name.strip():
+                break
+            name = name.strip()
+
+            channel = simpledialog.askinteger(
+                "Import Targets",
+                f"Channel for '{name}' (1-16):",
+                parent=self,
+                minvalue=1,
+                maxvalue=16,
+                initialvalue=next_channel,
+            )
+            if channel is None:
+                break
+
+            aliases = simpledialog.askstring(
+                "Import Targets",
+                "Aliases CSV (optional):",
+                parent=self,
+            ) or ""
+            default_bank = simpledialog.askstring(
+                "Import Targets",
+                "Default bank (optional, Enter for plugin1):",
+                parent=self,
+            )
+            default_bank = default_bank.strip() if default_bank else "plugin1"
+
+            try:
+                msg = self.controller.add_target(name, channel, aliases, default_bank)
+                self._log(msg)
+                count += 1
+                if channel < 16:
+                    next_channel = channel + 1
+            except Exception as e:
+                self._log(f"Import target error: {e}")
+                continue
+
+            again = messagebox.askyesno("Import Targets", "Import another track?", parent=self)
+            if not again:
+                break
+
+        self.target_combo.configure(values=self.controller.available_targets())
+        self._log(f"Import complete. Added {count} target(s).")
+
+    def on_session_setup_wizard(self) -> None:
+        self._log("Session Setup Wizard started.")
+        self.refresh_ports()
+        current = self.port_var.get().strip()
+        suggested = current
+        ports = self.controller.available_ports()
+        if not suggested and ports:
+            suggested = ports[0]
+        selected = simpledialog.askstring(
+            "Session Setup",
+            "Step 1/4: Enter or select MIDI output port name:",
+            parent=self,
+            initialvalue=suggested,
+        )
+        if not selected or not selected.strip():
+            self._log("Session Setup canceled at port selection.")
+            return
+        self.port_var.set(selected.strip())
+        self._apply_port_from_ui()
+
+        run_import = messagebox.askyesno(
+            "Session Setup",
+            "Step 2/4: Import tracks/targets now?",
+            parent=self,
+        )
+        if run_import:
+            self.on_import_targets()
+
+        verify_choice = messagebox.askyesnocancel(
+            "Session Setup",
+            "Step 3/4: Run channel verify?\nYes = verify current channel\nNo = verify all channels\nCancel = skip",
+            parent=self,
+        )
+        if verify_choice is True:
+            self.on_verify_current_channel()
+        elif verify_choice is False:
+            self.on_verify_all_channels()
+
+        run_bind = messagebox.askyesno(
+            "Session Setup",
+            "Step 4/4: Run Learn Bind for selected param now?",
+            parent=self,
+        )
+        if run_bind:
+            self.on_learn_bind()
+        self._log("Session Setup Wizard complete.")
+
+    def on_verify_all_channels(self) -> None:
+        if self.controller.dry_run:
+            proceed = messagebox.askyesno("VoiceMix", "You are in DRY mode. Run dry preview anyway?", parent=self)
+            if not proceed:
+                return
+        try:
+            lines = self.controller.channel_verify(cc=119, start_channel=1, end_channel=16)
+            for line in lines:
+                self._log(line)
+        except Exception as e:
+            self._log(f"Verify error: {e}")
+
+    def on_verify_current_channel(self) -> None:
+        if self.controller.dry_run:
+            proceed = messagebox.askyesno("VoiceMix", "You are in DRY mode. Run dry preview anyway?", parent=self)
+            if not proceed:
+                return
+        try:
+            ch = self.controller.current_channel
+            lines = self.controller.channel_verify(cc=119, start_channel=ch, end_channel=ch)
+            for line in lines:
+                self._log(line)
+        except Exception as e:
+            self._log(f"Verify error: {e}")
+
+    def on_learn_bind(self) -> None:
+        target_name = self.target_var.get().strip() or self.controller.current_target
+        bank = self.bank_var.get().strip() or self.controller.current_bank
+        param = self.param_var.get().strip()
+        if not param:
+            self._log("Learn bind error: no parameter selected.")
+            return
+
+        channel = simpledialog.askinteger(
+            "Logic Learn Bind",
+            f"Channel for target '{target_name}' (1-16):",
+            parent=self,
+            minvalue=1,
+            maxvalue=16,
+            initialvalue=self.controller.current_channel,
+        )
+        if channel is None:
+            return
+        aliases = simpledialog.askstring(
+            "Logic Learn Bind",
+            "Optional aliases CSV for this target:",
+            parent=self,
+        ) or ""
+
+        if self.controller.dry_run:
+            proceed = messagebox.askyesno(
+                "VoiceMix",
+                "You are in DRY mode. Run dry learn preview only?\n(Choose No and switch to APPLY to send real MIDI.)",
+                parent=self,
+            )
+            if not proceed:
+                return
+
+        try:
+            lines = self.controller.pulse_param_for_learn(
+                target_name=target_name,
+                channel=channel,
+                bank=bank,
+                param=param,
+                aliases_csv=aliases,
+            )
+            self.target_combo.configure(values=self.controller.available_targets())
+            self.target_var.set(self.controller.current_target)
+            self.bank_var.set(self.controller.current_bank)
+            for line in lines:
+                self._log(line)
+        except Exception as e:
+            self._log(f"Learn bind error: {e}")
 
     def refresh_presets(self) -> None:
         names = self.controller.list_presets()
